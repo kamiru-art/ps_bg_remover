@@ -57,7 +57,8 @@ class KamiruApp:
         saved = load_settings()
         self.input_dir = tk.StringVar(value=saved.input_dir)
         self.output_dir = tk.StringVar(value=saved.output_dir)
-        self.mode = tk.StringVar(value=saved.mode)
+        self.mode = tk.StringVar(
+            value=saved.mode if saved.mode in ("conjunto", "individual") else "conjunto")
         self.format_label = tk.StringVar(
             value=saved.format_label if saved.format_label in FORMAT_LABELS
             else "PNG (transparente)")
@@ -73,6 +74,8 @@ class KamiruApp:
         self.chroma_auto = tk.BooleanVar(value=True)
         self.chroma_color: tuple[int, int, int] | None = None
         self.dropped_files: list[Path] = []
+        # escribir otra ruta en el campo deja sin efecto las fotos sueltas
+        self.input_dir.trace_add("write", self._on_input_edited)
 
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -178,6 +181,8 @@ class KamiruApp:
             side="left", padx=(10, 0))
         self._chroma_swatch = tk.Label(a3, text="  auto  ", relief="sunken")
         self._chroma_swatch.pack(side="left", padx=(8, 0))
+        self._swatch_bg = self._chroma_swatch.cget("bg")
+        self.chroma_auto.trace_add("write", self._on_chroma_auto)
 
         a4 = ttk.Frame(self.adv); a4.pack(fill="x", **pad)
         ttk.Label(a4, text="Calidad:", width=15).pack(side="left")
@@ -245,9 +250,18 @@ class KamiruApp:
         elif files:
             self._set_files(files)
 
+    @staticmethod
+    def _files_label(files: list[Path]) -> str:
+        return f"{len(files)} foto(s) elegidas"
+
+    def _on_input_edited(self, *_args) -> None:
+        if self.dropped_files and self.input_dir.get() != self._files_label(
+                self.dropped_files):
+            self.dropped_files = []
+
     def _set_files(self, files: list[Path]) -> None:
         self.dropped_files = files
-        self.input_dir.set(f"{len(files)} foto(s) elegidas")
+        self.input_dir.set(self._files_label(files))
         self._set_status("Fotos elegidas: " + ", ".join(f.name for f in files[:6])
                          + ("…" if len(files) > 6 else ""))
 
@@ -278,6 +292,11 @@ class KamiruApp:
             self.chroma_auto.set(False)
             hexcol = "#%02x%02x%02x" % self.chroma_color
             self._chroma_swatch.configure(text="        ", bg=hexcol)
+
+    def _on_chroma_auto(self, *_args) -> None:
+        # en automático el motor no usa el color elegido: no mostrarlo
+        if self.chroma_auto.get():
+            self._chroma_swatch.configure(text="  auto  ", bg=self._swatch_bg)
 
     def _open_output(self) -> None:
         out = self.output_dir.get().strip()

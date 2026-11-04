@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, fields
 
 from .paths import app_root
@@ -51,9 +52,13 @@ def load_settings() -> Settings:
 
 
 def save_settings(s: Settings) -> None:
+    # temporal + renombre: un corte a mitad no deja un JSON roto
+    path = settings_path()
+    tmp = path.with_name(path.name + ".part")
     try:
-        settings_path().write_text(
+        tmp.write_text(
             json.dumps(asdict(s), indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        os.replace(tmp, path)
     except OSError:
         log.warning("No se pudo guardar settings.json")
