@@ -97,3 +97,93 @@ class TestEnsureModelOffline:
         assert path == str(tmp_path / "snap")
         assert "config.json" in downloaded and "model.safetensors" in downloaded
         assert any("2 archivo(s)" in m for m in msgs)
+
+
+class TestEnsureModelRealCache:
+    """Caché real de HuggingFace en disco; solo la red es falsa.
+
+    Formas de fallar que este escenario detecta:
+    1. Tras una descarga completa, la carga siguiente sin red no encuentra el
+       modelo: las descargas con ``revision=<hash>`` no escriben
+       ``refs/main``, y el camino offline lo necesita.
+    2. Con una caché parcial (descarga cortada) y un ``refs/main`` de una
+       versión anterior, el camino offline devuelve la carpeta incompleta y
+       nunca vuelve a descargar lo que falta.
+    3. Al reparar la caché parcial se baja de nuevo lo que ya estaba.
+    """
+
+    SHA = "0123456789abcdef0123456789abcdef01234567"
+    FILES = {"config.json": b'{"a": 1}', "model.safetensors": b"\1" * 2048,
+             "sub/extra.py": b"x = 1\n"}
+
+    def test_download_then_offline_then_repair(self, monkeypatch, tmp_path):
+        import huggingface_hub
+        from huggingface_hub import constants
+
+        from kamiru.core import model_fetch
+
+        monkeypatch.setenv("KAMIRU_HOME", str(tmp_path))
+        hub = tmp_path / "models" / "hub"
+        monkeypatch.setattr(constants, "HF_HUB_CACHE", str(hub))
+        repo_dir = hub / "models--fake--repo"
+        snap = repo_dir / "snapshots" / self.SHA
+
+        class Sibling:
+            def __init__(self, name, size):
+                self.rfilename, self.size = name, size
+
+        class Info:
+            sha = self.SHA
+            siblings = [Sibling(n, len(b)) for n, b in self.FILES.items()]
+
+        net = {"calls": 0, "downloaded": []}
+
+        class Api:
+            def __init__(self, token=None):
+                pass
+
+            def model_info(self, repo, files_metadata=False, timeout=None):
+                net["calls"] += 1
+                return Info()
+
+        def hub_download(repo, name, revision=None, token=None, etag_timeout=None):
+            # como la librería real con revision=<hash>: blob en snapshots/
+            # y sin escribir refs/main
+            net["calls"] += 1
+            assert revision == self.SHA
+            target = snap / name
+            if not target.exists():
+                net["downloaded"].append(name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self.FILES[name])
+            return str(target)
+
+        monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hub_download)
+
+        # corrida 1: caché vacía → descarga todo
+        first = model_fetch.ensure_model("fake/repo")
+        assert first == str(snap)
+        assert sorted(net["downloaded"]) == sorted(self.FILES)
+        assert not (repo_dir / "refs" / "main").exists()
+
+        # corrida 2: sin red → debe cargar de la caché
+        def no_network(*_a, **_k):
+            raise AssertionError("la carga con caché completa no debe tocar la red")
+
+        monkeypatch.setattr(huggingface_hub, "HfApi", no_network)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", no_network)
+        msgs = []
+        assert model_fetch.ensure_model("fake/repo", progress=msgs.append) == str(snap)
+        assert any("sin descarga ni red" in m for m in msgs)
+
+        # corrida 3: descarga cortada (falta un archivo) y un refs/main viejo
+        (snap / "model.safetensors").unlink()
+        (repo_dir / "refs").mkdir(exist_ok=True)
+        (repo_dir / "refs" / "main").write_text(self.SHA)
+        monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hub_download)
+        net["downloaded"].clear()
+        assert model_fetch.ensure_model("fake/repo") == str(snap)
+        assert net["downloaded"] == ["model.safetensors"]
+        assert all((snap / n).is_file() for n in self.FILES)
