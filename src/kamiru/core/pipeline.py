@@ -76,9 +76,16 @@ class ImageReport:
     consensus_iou: float | None = None  # coincidencia con el motor de contraste
 
 
+class BatchCancelled(Exception):
+    """Cancelar llegó mientras se recortaba una foto: esa foto no se exporta."""
+
+
 @dataclass
 class BatchSummary:
     reports: list[ImageReport] = field(default_factory=list)
+    with_verifier: bool = False         # hubo un motor de contraste
+    review_dir: Path | None = None      # destino de las dudosas, si se mueven
+    notes: list[str] = field(default_factory=list)  # avisos del lote entero
 
     @property
     def total(self) -> int:
@@ -110,12 +117,19 @@ class BatchSummary:
             f"Archivos exportados: {self.files_exported}",
         ]
         if self.to_review:
-            moved = any(o.parent.name == REVIEW_DIRNAME
-                        for r in self.to_review for o in r.outputs)
+            moved = self.review_dir is not None and any(
+                o.parent == self.review_dir for r in self.to_review for o in r.outputs)
             where = f" (en la carpeta «{REVIEW_DIRNAME}/»)" if moved else ""
             lines.append(f"Recortes dudosos{where}: {len(self.to_review)}")
             for r in self.to_review:
                 lines.append(f"  - {r.source.name}: {'; '.join(r.review_reasons)}")
+        if self.with_verifier:
+            unchecked = [r for r in self.reports if r.ok and r.consensus_iou is None]
+            if unchecked:
+                lines.append(
+                    f"Sin contraste del 2º modelo (solo control básico): "
+                    f"{len(unchecked)} ({', '.join(r.source.name for r in unchecked)})"
+                )
         if self.empty:
             lines.append(
                 f"Sin objetos detectados: {len(self.empty)} "
@@ -124,7 +138,12 @@ class BatchSummary:
         if self.failed:
             lines.append(f"Con error: {len(self.failed)}")
             for r in self.failed:
-                lines.append(f"  - {r.source.name}: {r.error}")
+                saved = ""
+                if r.outputs:
+                    saved = (f" (antes del error se guardaron {len(r.outputs)} "
+                             f"archivo(s): {', '.join(o.name for o in r.outputs)})")
+                lines.append(f"  - {r.source.name}: {r.error}{saved}")
+        lines.extend(f"Aviso: {n}" for n in self.notes)
         return "\n".join(lines)
 
 
@@ -146,9 +165,18 @@ def process_image(
     out_dir: Path,
     opts: BatchOptions,
     verifier: BaseMatter | None = None,
+    cancel: Callable[[], bool] | None = None,
+    report: ImageReport | None = None,
 ) -> ImageReport:
+    """Recorta y exporta una foto.
+
+    Los archivos se anotan en ``report.outputs`` a medida que se escriben.
+    Así, si la exportación falla a mitad, quien pasó ``report`` sabe qué
+    archivos ya quedaron en disco.
+    """
     t0 = time.perf_counter()
-    report = ImageReport(source=path, ok=True)
+    if report is None:
+        report = ImageReport(source=path, ok=True)
     loaded = load_image(path)
     result = matter.cutout(loaded.rgb)
     alpha = result.alpha
@@ -177,6 +205,9 @@ def process_image(
             # solo la ruta: la carpeta se crea recién al exportar, para no
             # dejar un revisar/ vacío si la foto no produce archivos
             out_dir = out_dir / REVIEW_DIRNAME
+
+    if cancel and cancel():
+        raise BatchCancelled
 
     if opts.mode == "conjunto":
         bbox = content_bbox(alpha, opts.alpha_threshold)
@@ -253,7 +284,10 @@ def run_batch(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = BatchSummary()
+    summary = BatchSummary(
+        with_verifier=verifier is not None,
+        review_dir=out_dir / REVIEW_DIRNAME if opts.move_uncertain else None,
+    )
     total = len(files)
     log.info("Lote: %d imágenes → %s (modo=%s, formato=%s)", total, out_dir, opts.mode, opts.fmt)
     for i, path in enumerate(files, start=1):
@@ -262,15 +296,23 @@ def run_batch(
             break
         if progress:
             progress(i - 1, total, path.name)
+        report = ImageReport(source=path, ok=True)
         try:
-            report = process_image(path, matter, out_dir, opts, verifier=verifier)
+            process_image(path, matter, out_dir, opts, verifier=verifier,
+                          cancel=cancel, report=report)
             log.info(
                 "%s: %d objeto(s), %d archivo(s), %.1fs",
                 path.name, report.objects_found, len(report.outputs), report.seconds,
             )
+        except BatchCancelled:
+            log.info("Lote cancelado por el usuario en %d/%d; %s no se exportó",
+                     i - 1, total, path.name)
+            break
         except Exception as exc:  # noqa: BLE001 — el lote sigue pase lo que pase
             log.error("%s: ERROR %s\n%s", path.name, exc, traceback.format_exc())
-            report = ImageReport(source=path, ok=False, error=str(exc))
+            # report.outputs conserva los archivos que alcanzaron a guardarse
+            report.ok = False
+            report.error = str(exc)
         summary.reports.append(report)
     if progress:
         progress(len(summary.reports), total, "")

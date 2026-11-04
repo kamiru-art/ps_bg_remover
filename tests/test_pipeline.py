@@ -181,3 +181,92 @@ def test_exif_orientation(tmp_path):
     result = PILImage.open(out / "rotada.png")
     # la pieza era 40x30 apaisada; tras rotar EXIF debe salir ~30x40
     assert result.height > result.width
+
+
+def test_lote_accidentado(tmp_path, monkeypatch):
+    """Un lote que se tuerce de varias formas a la vez.
+
+    Formas de fallar que este escenario detecta:
+    1. El disco se llena a mitad de una pieza y queda un archivo truncado con
+       un nombre final válido (o un temporal suelto en la carpeta).
+    2. Las piezas que sí se guardaron antes del error quedan fuera del
+       informe: el resumen no las cuenta ni las nombra.
+    3. El 2º modelo falla en una foto y el resumen no dice qué foto quedó
+       sin contraste.
+    4. Se cancela durante el recorte de una foto y esa foto se exporta igual.
+    5. La carpeta de salida se llama «revisar» y el resumen dice que movió
+       las dudosas aunque la opción está apagada.
+    """
+    import errno
+
+    inp = tmp_path / "in"
+    inp.mkdir()
+    # a: dos piezas, una toca el borde de la foto (dudosa)
+    scene([(0, 40, 60, 50, (200, 30, 40)), (180, 90, 70, 60, (30, 60, 200))]
+          ).save(inp / "a_dos.png")
+    # b: el 2º modelo falla con esta foto (pieza verde)
+    scene([(100, 60, 80, 80, (20, 160, 60))]).save(inp / "b_sin_contraste.png")
+    # c: tres piezas; el disco se llena al guardar la segunda
+    scene([(20, 20, 50, 50, (200, 30, 40)), (120, 20, 50, 50, (30, 60, 200)),
+           (220, 20, 50, 50, (200, 200, 20))]).save(inp / "c_tres.png")
+    # d: se cancela mientras se recorta
+    scene([(100, 60, 80, 80, (160, 40, 160))]).save(inp / "d_ultima.png")
+
+    cancelled = {"flag": False}
+
+    class CancelOnD(FakeMatter):
+        def cutout(self, rgb):
+            if np.asarray(rgb)[100, 140].tolist() == [160, 40, 160]:
+                cancelled["flag"] = True  # la persona aprieta Cancelar ahora
+            return super().cutout(rgb)
+
+    class VerifierFailsOnGreen(FakeMatter):
+        def alpha(self, rgb):
+            if np.asarray(rgb)[100, 140].tolist() == [20, 160, 60]:
+                raise RuntimeError("sin memoria en el 2º modelo")
+            return super().alpha(rgb)
+
+    real_save = Image.Image.save
+
+    def disk_full_on_c02(self, fp, *args, **kwargs):
+        if "c_tres_02" in str(fp):
+            with open(fp, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n" + b"\0" * 64)  # mitad de archivo
+            raise OSError(errno.ENOSPC, "No queda espacio en el disco")
+        return real_save(self, fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", disk_full_on_c02)
+
+    out = tmp_path / "revisar"  # la carpeta elegida ya se llama así
+    s = run_batch(inp, out, CancelOnD(),
+                  BatchOptions(mode="individual", fmt="png", min_area=100,
+                               move_uncertain=False),
+                  cancel=lambda: cancelled["flag"],
+                  verifier=VerifierFailsOnGreen())
+    monkeypatch.setattr(Image.Image, "save", real_save)
+
+    on_disk = sorted(p.name for p in out.iterdir())
+    # 1. sin truncados ni temporales: solo archivos completos
+    assert on_disk == ["a_dos_01.png", "a_dos_02.png", "b_sin_contraste_01.png",
+                       "c_tres_01.png"]
+    for name in on_disk:
+        Image.open(out / name).load()  # decodifica entero
+    # 4. la foto cancelada no se exportó ni cuenta en el resumen
+    assert [r.source.name for r in s.reports] == ["a_dos.png", "b_sin_contraste.png",
+                                                  "c_tres.png"]
+    # 2. la foto con error conserva lo que alcanzó a guardar
+    rep = {r.source.name: r for r in s.reports}
+    assert not rep["c_tres.png"].ok
+    assert [p.name for p in rep["c_tres.png"].outputs] == ["c_tres_01.png"]
+    assert s.files_exported == len(on_disk)
+    text = s.text()
+    assert "Archivos exportados: 4" in text
+    assert "c_tres.png" in text and "1 archivo(s)" in text
+    # 3. el resumen nombra la foto que quedó sin contraste
+    assert rep["b_sin_contraste.png"].consensus_iou is None
+    sin_contraste = [l for l in text.splitlines() if "contraste" in l]
+    assert sin_contraste and "b_sin_contraste.png" in sin_contraste[0]
+    assert "a_dos.png" not in sin_contraste[0]
+    # 5. dudosa reportada, pero sin decir que se movió
+    assert "Recortes dudosos: 1" in text
+    assert "«revisar/»" not in text
