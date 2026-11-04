@@ -20,7 +20,8 @@ La carpeta `dist/Kamiru` que produce el build contiene **`Kamiru.exe`**
 dependencias adentro: se copia a cualquier máquina del mismo sistema
 operativo y se abre con doble clic, sin instalar nada. Al primer uso la app
 descarga el modelo a `models/` junto al ejecutable (con progreso detallado
-en la barra de estado) y no vuelve a bajarlo.
+en la barra de estado) y no vuelve a bajarlo. Sin token de HuggingFace
+(ver abajo) la app usa BiRefNet y lo deja como modelo por defecto.
 
 - **Para generarlo:** `packaging/build_release.bat` (Windows — detecta la
   GPU y empaqueta PyTorch CUDA 12.8) o `packaging/build_release.command`
@@ -76,7 +77,8 @@ RMBG-2.0 es un repositorio *gated*: gratis, pero con registro.
 Si se salta este paso, el setup descarga automáticamente **BiRefNet** (misma
 arquitectura, sin registro) y lo deja como modelo por defecto; se puede
 volver a RMBG-2.0 después pegando el token y re-corriendo
-`scripts/download_model.py`.
+`scripts/download_model.py`. La GUI sigue ese modelo por defecto mientras
+no se elija otro a mano en "Avanzado".
 
 ### Verificación rápida
 

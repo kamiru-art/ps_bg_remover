@@ -27,6 +27,8 @@ MODEL_REPOS: dict[str, str] = {
     "ben2": "PramaLLC/BEN2",
 }
 DEFAULT_MODEL = "rmbg-2.0"
+# Modelo sin registro que reemplaza a RMBG-2.0 cuando no hay token con acceso
+GATED_FALLBACK_MODEL = "birefnet"
 
 GATED_HELP = (
     "RMBG-2.0 es un repositorio 'gated' en HuggingFace. Para usarlo:\n"
@@ -37,6 +39,10 @@ GATED_HELP = (
     "Mientras tanto la app puede usar el modelo alternativo 'birefnet' "
     "(misma arquitectura, sin registro)."
 )
+
+
+class GatedModelError(RuntimeError):
+    """El repositorio pide registro en HuggingFace y no hay token con acceso."""
 
 
 # Preferencia del modelo de contraste (nivel 2): primero los que no piden
@@ -149,7 +155,7 @@ class NeuralMatter(BaseMatter):
         except Exception as exc:
             msg = str(exc).lower()
             if "gated" in msg or "401" in msg:
-                raise RuntimeError(
+                raise GatedModelError(
                     f"No hay acceso al modelo {self.repo} (repo gated).\n\n{GATED_HELP}"
                 ) from exc
             raise

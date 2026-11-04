@@ -21,7 +21,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 from .. import APP_NAME, __version__
 from ..core.imageio import SUPPORTED_EXTENSIONS, is_supported, list_images
 from ..core.pipeline import BatchOptions, run_batch, setup_batch_logging
-from ..paths import logs_dir
+from ..paths import default_model_file, logs_dir
 from ..settings import Settings, load_settings, save_settings
 
 log = logging.getLogger("kamiru.gui")
@@ -62,7 +62,8 @@ class KamiruApp:
             value=saved.format_label if saved.format_label in FORMAT_LABELS
             else "PNG (transparente)")
         self.suffix = tk.StringVar(value=saved.suffix)
-        self.model = tk.StringVar(value=saved.model or resolve_default_model())
+        saved_model = saved.model if saved.model in MODEL_CHOICES else ""
+        self.model = tk.StringVar(value=saved_model or resolve_default_model())
         self.resolution = tk.StringVar(
             value=saved.resolution if saved.resolution in RESOLUTIONS else "1024")
         self.min_area = tk.StringVar(value=saved.min_area)
@@ -301,13 +302,20 @@ class KamiruApp:
         self.root.destroy()
 
     def _save_settings(self) -> None:
+        from ..core.matting import resolve_default_model
+
+        # El modelo por defecto se guarda vacío: así la GUI sigue a
+        # default_model.txt, que el setup y download_model.py actualizan.
+        model = self.model.get()
+        if model == resolve_default_model():
+            model = ""
         save_settings(Settings(
             input_dir="" if self.dropped_files else self.input_dir.get(),
             output_dir=self.output_dir.get(),
             mode=self.mode.get(),
             format_label=self.format_label.get(),
             suffix=self.suffix.get(),
-            model=self.model.get(),
+            model=model,
             resolution=self.resolution.get(),
             min_area=self.min_area.get(),
             split_touching=self.split_touching.get(),
@@ -330,15 +338,18 @@ class KamiruApp:
     def _matter_spec(self) -> dict:
         """Lee la config del motor EN EL HILO PRINCIPAL (Tk no es thread-safe:
         leer variables Tk desde el worker se cuelga o muere en silencio)."""
+        from ..core.matting import resolve_default_model
+
         return {
             "choice": self.model.get(),
+            "is_default": self.model.get() == resolve_default_model(),
             "resolution": int(self.resolution.get()),
             "chroma_auto": self.chroma_auto.get(),
             "chroma_color": self.chroma_color,
             "verify": self.verify_second.get(),
         }
 
-    def _build_matter(self, spec: dict, gen: int):
+    def _build_matter(self, spec: dict, gen: int, notes: list[str] | None = None):
         """Corre en el worker: usa solo valores planos, nada de widgets Tk."""
         choice = spec["choice"]
         if choice.startswith("croma"):
@@ -346,13 +357,35 @@ class KamiruApp:
 
             key = None if spec["chroma_auto"] else spec["chroma_color"]
             return ChromaMatter(key_color=key)
-        key = (choice, spec["resolution"])
+        from ..core.matting import DEFAULT_MODEL, GATED_FALLBACK_MODEL, GatedModelError
+
+        try:
+            return self._cached_matter(choice, spec["resolution"], gen)
+        except GatedModelError:
+            # sin token con acceso: la misma salida que el setup
+            # (download_model.py), solo si RMBG-2.0 llegó por defecto
+            if choice != DEFAULT_MODEL or not spec["is_default"]:
+                raise
+        log.warning("Sin acceso a %s; se usa %s", choice, GATED_FALLBACK_MODEL)
+        self._queue.put(("status", gen, "RMBG-2.0 pide una cuenta de HuggingFace. "
+                                        "Uso el modelo BiRefNet, que no la pide..."))
+        matter = self._cached_matter(GATED_FALLBACK_MODEL, spec["resolution"], gen)
+        default_model_file().write_text(GATED_FALLBACK_MODEL, encoding="utf-8")
+        self._queue.put(("model", GATED_FALLBACK_MODEL))
+        if notes is not None:
+            notes.append("se usó el modelo BiRefNet porque RMBG-2.0 pide una cuenta "
+                         "de HuggingFace. Para volver a RMBG-2.0 hay que pegar el "
+                         "token (ver README).")
+        return matter
+
+    def _cached_matter(self, choice: str, resolution: int, gen: int):
+        key = (choice, resolution)
         if self._matter is not None and self._matter_key == key:
             return self._matter  # ya cargado, no re-descargar ni re-cargar
         from ..core.matting import load_matter
 
         matter = load_matter(
-            choice, process_resolution=spec["resolution"],
+            choice, process_resolution=resolution,
             progress=lambda msg: self._queue.put(("status", gen, msg)),
         )
         # aunque este trabajo haya sido cancelado, el modelo queda cacheado
@@ -360,8 +393,11 @@ class KamiruApp:
         self._matter, self._matter_key = matter, key
         return matter
 
-    def _build_verifier(self, spec: dict, gen: int):
-        """Motor de contraste (2º modelo), con su propio cache entre corridas."""
+    def _build_verifier(self, spec: dict, gen: int, primary: str):
+        """Motor de contraste (2º modelo), con su propio cache entre corridas.
+
+        ``primary`` es el modelo que cargó de verdad el motor principal.
+        """
         from ..core.matting import pick_verifier_model
 
         choice = spec["choice"]
@@ -370,7 +406,7 @@ class KamiruApp:
             # solo marcaría casi todo como dudoso (falsas alarmas)
             log.info("Motor croma: se omite el modelo de contraste")
             return None
-        vchoice = pick_verifier_model(choice)
+        vchoice = pick_verifier_model(primary)
         key = (vchoice, spec["resolution"])
         if self._verifier is not None and self._verifier_key == key:
             return self._verifier
@@ -476,11 +512,11 @@ class KamiruApp:
         def work():
             try:
                 notes: list[str] = []
-                matter = self._build_matter(spec, gen)
+                matter = self._build_matter(spec, gen, notes)
                 verifier = None
                 if spec["verify"]:
                     try:
-                        verifier = self._build_verifier(spec, gen)
+                        verifier = self._build_verifier(spec, gen, matter.name)
                     except Exception:
                         # el contraste es un extra: si el 2º modelo no carga
                         # (sin red, sin disco), el lote sigue con el motor
@@ -607,6 +643,10 @@ class KamiruApp:
                     continue
                 if kind == "device_error":
                     self.device_lbl.configure(text="PyTorch no disponible")
+                    continue
+                if kind == "model":
+                    # caída a BiRefNet sin token: vale aunque se haya cancelado
+                    self.model.set(msg[1])
                     continue
 
                 # el resto de los mensajes vienen etiquetados con la
