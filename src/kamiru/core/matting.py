@@ -27,6 +27,8 @@ MODEL_REPOS: dict[str, str] = {
     "ben2": "PramaLLC/BEN2",
 }
 DEFAULT_MODEL = "rmbg-2.0"
+# Modelo sin registro que reemplaza a RMBG-2.0 cuando no hay token con acceso
+GATED_FALLBACK_MODEL = "birefnet"
 
 GATED_HELP = (
     "RMBG-2.0 es un repositorio 'gated' en HuggingFace. Para usarlo:\n"
@@ -37,6 +39,10 @@ GATED_HELP = (
     "Mientras tanto la app puede usar el modelo alternativo 'birefnet' "
     "(misma arquitectura, sin registro)."
 )
+
+
+class GatedModelError(RuntimeError):
+    """El repositorio pide registro en HuggingFace y no hay token con acceso."""
 
 
 # Preferencia del modelo de contraste (nivel 2): primero los que no piden
@@ -83,10 +89,16 @@ class MatteResult:
     rgba: Image.Image        # RGBA a resolución completa
 
 
+# Aviso para el resumen cuando un motor cayó de la GPU a la CPU.
+CPU_FALLBACK_NOTE = "la GPU falló y el resto del lote siguió en la CPU (más lento)."
+
+
 class BaseMatter:
     """Interfaz común de los motores de recorte."""
 
     name = "base"
+    # True cuando una inferencia falló en la GPU y el motor pasó a la CPU
+    fell_back_to_cpu = False
 
     def alpha(self, rgb: Image.Image) -> np.ndarray:
         raise NotImplementedError
@@ -143,7 +155,7 @@ class NeuralMatter(BaseMatter):
         except Exception as exc:
             msg = str(exc).lower()
             if "gated" in msg or "401" in msg:
-                raise RuntimeError(
+                raise GatedModelError(
                     f"No hay acceso al modelo {self.repo} (repo gated).\n\n{GATED_HELP}"
                 ) from exc
             raise
@@ -198,12 +210,16 @@ class NeuralMatter(BaseMatter):
             try:
                 preds = self._forward(tensor)
             except RuntimeError:
-                if self.device_info.kind != "cpu":
-                    # Fallback: algunas ops pueden no estar soportadas en MPS
-                    log.warning("Fallo en %s; reintentando en CPU", self.device_info.kind)
+                if self._device.type != "cpu":
+                    # Fallback: cualquier RuntimeError en GPU (op no soportada
+                    # en MPS, memoria agotada en CUDA...) repite la foto en
+                    # CPU. El motor queda en CPU; fell_back_to_cpu lo avisa.
+                    log.warning("Fallo en %s; reintentando en CPU", self._device.type,
+                                exc_info=True)
                     self.model.float().to("cpu")
                     self._device = torch.device("cpu")
                     self._half = False
+                    self.fell_back_to_cpu = True
                     preds = self._forward(self._preprocess(rgb))
                 else:
                     raise

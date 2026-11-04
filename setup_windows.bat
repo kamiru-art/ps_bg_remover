@@ -7,6 +7,11 @@ REM  CUDA para la RTX 5070 Ti, la app y descarga el modelo.
 REM ============================================================
 cd /d "%~dp0"
 
+REM Kamiru.bat abre la app solo si existe este marcador. Se borra al empezar
+REM y se crea en el paso 6, cuando la app ya puede abrir.
+set "MARCA=venv\kamiru_instalado.txt"
+if exist "%MARCA%" del "%MARCA%"
+
 echo.
 echo === Kamiru: instalacion ===
 echo.
@@ -56,14 +61,18 @@ if %errorlevel%==0 (
     )
 ) else (
     echo AVISO: no se detecto GPU NVIDIA. Instalando PyTorch para CPU ^(mas lento^).
-    %UV% pip install --python %VPY% torch torchvision
+    %UV% pip install --python %VPY% torch torchvision || (
+        echo ERROR instalando PyTorch & pause & exit /b 1
+    )
 )
 
 REM --- 5. Instalar la app y sus dependencias
 %UV% pip install --python %VPY% -e . || (echo ERROR instalando dependencias & pause & exit /b 1)
 
-REM --- 6. Verificar GPU
+REM --- 6. Verificar la GPU y que la app pueda abrir
 %VPY% -c "import torch; ok=torch.cuda.is_available(); print('CUDA disponible:', ok); print('GPU:', torch.cuda.get_device_name(0) if ok else 'ninguna (se usara CPU, mas lento)')"
+%VPY% -c "import torch, kamiru.gui.app" || (echo ERROR: la app no quedo instalada. Revisa los mensajes de arriba. & pause & exit /b 1)
+echo ok> "%MARCA%"
 
 REM --- 7. Token de HuggingFace (RMBG-2.0 es un repo con registro)
 if not exist models mkdir models

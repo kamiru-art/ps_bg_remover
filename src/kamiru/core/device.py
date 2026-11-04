@@ -59,7 +59,8 @@ def detect_device() -> DeviceInfo:
         name = torch.cuda.get_device_name(0)
         cap = torch.cuda.get_device_capability(0)
         status = arch_status(cap, torch.cuda.get_arch_list())
-        if status == "native" or os.environ.get("KAMIRU_FORCE_CUDA"):
+        force = os.environ.get("KAMIRU_FORCE_CUDA", "").strip().lower()
+        if status == "native" or force in ("1", "true", "yes", "si", "sí"):
             return DeviceInfo("cuda", f"GPU NVIDIA: {name}")
         return DeviceInfo(
             "cpu",

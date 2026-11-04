@@ -21,7 +21,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 from .. import APP_NAME, __version__
 from ..core.imageio import SUPPORTED_EXTENSIONS, is_supported, list_images
 from ..core.pipeline import BatchOptions, run_batch, setup_batch_logging
-from ..paths import logs_dir
+from ..paths import default_model_file, logs_dir
 from ..settings import Settings, load_settings, save_settings
 
 log = logging.getLogger("kamiru.gui")
@@ -57,12 +57,14 @@ class KamiruApp:
         saved = load_settings()
         self.input_dir = tk.StringVar(value=saved.input_dir)
         self.output_dir = tk.StringVar(value=saved.output_dir)
-        self.mode = tk.StringVar(value=saved.mode)
+        self.mode = tk.StringVar(
+            value=saved.mode if saved.mode in ("conjunto", "individual") else "conjunto")
         self.format_label = tk.StringVar(
             value=saved.format_label if saved.format_label in FORMAT_LABELS
             else "PNG (transparente)")
         self.suffix = tk.StringVar(value=saved.suffix)
-        self.model = tk.StringVar(value=saved.model or resolve_default_model())
+        saved_model = saved.model if saved.model in MODEL_CHOICES else ""
+        self.model = tk.StringVar(value=saved_model or resolve_default_model())
         self.resolution = tk.StringVar(
             value=saved.resolution if saved.resolution in RESOLUTIONS else "1024")
         self.min_area = tk.StringVar(value=saved.min_area)
@@ -72,6 +74,8 @@ class KamiruApp:
         self.chroma_auto = tk.BooleanVar(value=True)
         self.chroma_color: tuple[int, int, int] | None = None
         self.dropped_files: list[Path] = []
+        # escribir otra ruta en el campo deja sin efecto las fotos sueltas
+        self.input_dir.trace_add("write", self._on_input_edited)
 
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -84,6 +88,10 @@ class KamiruApp:
         # queda "huérfano" — la UI se libera al instante sin esperar al hilo
         self._job_gen = 0
         self._busy_since: float | None = None
+        # un solo hilo usa los motores (y escribe en la salida) a la vez: el
+        # trabajo nuevo espera a que el huérfano termine su carga o su foto
+        self._engine_lock = threading.Lock()
+        self._device_name = ""  # dispositivo detectado al abrir la app
 
         self._build_ui()
         self._logfile = setup_batch_logging(logs_dir())
@@ -173,6 +181,8 @@ class KamiruApp:
             side="left", padx=(10, 0))
         self._chroma_swatch = tk.Label(a3, text="  auto  ", relief="sunken")
         self._chroma_swatch.pack(side="left", padx=(8, 0))
+        self._swatch_bg = self._chroma_swatch.cget("bg")
+        self.chroma_auto.trace_add("write", self._on_chroma_auto)
 
         a4 = ttk.Frame(self.adv); a4.pack(fill="x", **pad)
         ttk.Label(a4, text="Calidad:", width=15).pack(side="left")
@@ -240,9 +250,18 @@ class KamiruApp:
         elif files:
             self._set_files(files)
 
+    @staticmethod
+    def _files_label(files: list[Path]) -> str:
+        return f"{len(files)} foto(s) elegidas"
+
+    def _on_input_edited(self, *_args) -> None:
+        if self.dropped_files and self.input_dir.get() != self._files_label(
+                self.dropped_files):
+            self.dropped_files = []
+
     def _set_files(self, files: list[Path]) -> None:
         self.dropped_files = files
-        self.input_dir.set(f"{len(files)} foto(s) elegidas")
+        self.input_dir.set(self._files_label(files))
         self._set_status("Fotos elegidas: " + ", ".join(f.name for f in files[:6])
                          + ("…" if len(files) > 6 else ""))
 
@@ -274,6 +293,11 @@ class KamiruApp:
             hexcol = "#%02x%02x%02x" % self.chroma_color
             self._chroma_swatch.configure(text="        ", bg=hexcol)
 
+    def _on_chroma_auto(self, *_args) -> None:
+        # en automático el motor no usa el color elegido: no mostrarlo
+        if self.chroma_auto.get():
+            self._chroma_swatch.configure(text="  auto  ", bg=self._swatch_bg)
+
     def _open_output(self) -> None:
         out = self.output_dir.get().strip()
         if not out or not Path(out).is_dir():
@@ -289,17 +313,28 @@ class KamiruApp:
             subprocess.Popen(["xdg-open", out])
 
     def _on_close(self) -> None:
+        if self._busy_since is not None and not messagebox.askyesno(
+                APP_NAME, "Hay un trabajo en curso. Si cierras ahora, se corta "
+                          "y la foto en curso no se guarda.\n\n¿Cerrar igual?"):
+            return
         self._save_settings()
         self.root.destroy()
 
     def _save_settings(self) -> None:
+        from ..core.matting import resolve_default_model
+
+        # El modelo por defecto se guarda vacío: así la GUI sigue a
+        # default_model.txt, que el setup y download_model.py actualizan.
+        model = self.model.get()
+        if model == resolve_default_model():
+            model = ""
         save_settings(Settings(
             input_dir="" if self.dropped_files else self.input_dir.get(),
             output_dir=self.output_dir.get(),
             mode=self.mode.get(),
             format_label=self.format_label.get(),
             suffix=self.suffix.get(),
-            model=self.model.get(),
+            model=model,
             resolution=self.resolution.get(),
             min_area=self.min_area.get(),
             split_touching=self.split_touching.get(),
@@ -322,15 +357,18 @@ class KamiruApp:
     def _matter_spec(self) -> dict:
         """Lee la config del motor EN EL HILO PRINCIPAL (Tk no es thread-safe:
         leer variables Tk desde el worker se cuelga o muere en silencio)."""
+        from ..core.matting import resolve_default_model
+
         return {
             "choice": self.model.get(),
+            "is_default": self.model.get() == resolve_default_model(),
             "resolution": int(self.resolution.get()),
             "chroma_auto": self.chroma_auto.get(),
             "chroma_color": self.chroma_color,
             "verify": self.verify_second.get(),
         }
 
-    def _build_matter(self, spec: dict, gen: int):
+    def _build_matter(self, spec: dict, gen: int, notes: list[str] | None = None):
         """Corre en el worker: usa solo valores planos, nada de widgets Tk."""
         choice = spec["choice"]
         if choice.startswith("croma"):
@@ -338,13 +376,35 @@ class KamiruApp:
 
             key = None if spec["chroma_auto"] else spec["chroma_color"]
             return ChromaMatter(key_color=key)
-        key = (choice, spec["resolution"])
+        from ..core.matting import DEFAULT_MODEL, GATED_FALLBACK_MODEL, GatedModelError
+
+        try:
+            return self._cached_matter(choice, spec["resolution"], gen)
+        except GatedModelError:
+            # sin token con acceso: la misma salida que el setup
+            # (download_model.py), solo si RMBG-2.0 llegó por defecto
+            if choice != DEFAULT_MODEL or not spec["is_default"]:
+                raise
+        log.warning("Sin acceso a %s; se usa %s", choice, GATED_FALLBACK_MODEL)
+        self._queue.put(("status", gen, "RMBG-2.0 pide una cuenta de HuggingFace. "
+                                        "Uso el modelo BiRefNet, que no la pide..."))
+        matter = self._cached_matter(GATED_FALLBACK_MODEL, spec["resolution"], gen)
+        default_model_file().write_text(GATED_FALLBACK_MODEL, encoding="utf-8")
+        self._queue.put(("model", GATED_FALLBACK_MODEL))
+        if notes is not None:
+            notes.append("se usó el modelo BiRefNet porque RMBG-2.0 pide una cuenta "
+                         "de HuggingFace. Para volver a RMBG-2.0 hay que pegar el "
+                         "token (ver README).")
+        return matter
+
+    def _cached_matter(self, choice: str, resolution: int, gen: int):
+        key = (choice, resolution)
         if self._matter is not None and self._matter_key == key:
             return self._matter  # ya cargado, no re-descargar ni re-cargar
         from ..core.matting import load_matter
 
         matter = load_matter(
-            choice, process_resolution=spec["resolution"],
+            choice, process_resolution=resolution,
             progress=lambda msg: self._queue.put(("status", gen, msg)),
         )
         # aunque este trabajo haya sido cancelado, el modelo queda cacheado
@@ -352,8 +412,11 @@ class KamiruApp:
         self._matter, self._matter_key = matter, key
         return matter
 
-    def _build_verifier(self, spec: dict, gen: int):
-        """Motor de contraste (2º modelo), con su propio cache entre corridas."""
+    def _build_verifier(self, spec: dict, gen: int, primary: str):
+        """Motor de contraste (2º modelo), con su propio cache entre corridas.
+
+        ``primary`` es el modelo que cargó de verdad el motor principal.
+        """
         from ..core.matting import pick_verifier_model
 
         choice = spec["choice"]
@@ -362,7 +425,7 @@ class KamiruApp:
             # solo marcaría casi todo como dudoso (falsas alarmas)
             log.info("Motor croma: se omite el modelo de contraste")
             return None
-        vchoice = pick_verifier_model(choice)
+        vchoice = pick_verifier_model(primary)
         key = (vchoice, spec["resolution"])
         if self._verifier is not None and self._verifier_key == key:
             return self._verifier
@@ -374,6 +437,21 @@ class KamiruApp:
         )
         self._verifier, self._verifier_key = verifier, key
         return verifier
+
+    def _drop_cpu_fallbacks(self) -> bool:
+        """Saca de la caché los motores que cayeron a CPU (corre en el worker).
+
+        El próximo trabajo los vuelve a cargar en la GPU. Devuelve True si
+        alguno había caído.
+        """
+        fell = False
+        if self._matter is not None and self._matter.fell_back_to_cpu:
+            self._matter, self._matter_key = None, None
+            fell = True
+        if self._verifier is not None and self._verifier.fell_back_to_cpu:
+            self._verifier, self._verifier_key = None, None
+            fell = True
+        return fell
 
     def _validated_options(self) -> BatchOptions | None:
         try:
@@ -401,6 +479,8 @@ class KamiruApp:
         self.run_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        if self._device_name:  # tras una caída a CPU el motor se recarga en GPU
+            self.device_lbl.configure(text=self._device_name)
         return gen
 
     def _end_job(self) -> None:
@@ -412,6 +492,23 @@ class KamiruApp:
 
     def _is_stale(self, gen: int) -> bool:
         return gen != self._job_gen or self._cancel.is_set()
+
+    def _exclusive(self, gen: int, job) -> None:
+        """Corre ``job`` en el worker con los motores para él solo.
+
+        Tras Cancelar, el hilo viejo puede seguir cargando el modelo o
+        recortando la foto en curso. El trabajo nuevo espera a que termine:
+        así no se carga el modelo dos veces ni corren dos recortes a la vez.
+        """
+        if not self._engine_lock.acquire(blocking=False):
+            self._queue.put(("status", gen, "Esperando a que termine el trabajo "
+                                            "cancelado..."))
+            self._engine_lock.acquire()
+        try:
+            if not self._is_stale(gen):
+                job()
+        finally:
+            self._engine_lock.release()
 
     def _start(self) -> None:
         inputs = self._collect_inputs()
@@ -433,11 +530,12 @@ class KamiruApp:
 
         def work():
             try:
-                matter = self._build_matter(spec, gen)
+                notes: list[str] = []
+                matter = self._build_matter(spec, gen, notes)
                 verifier = None
                 if spec["verify"]:
                     try:
-                        verifier = self._build_verifier(spec, gen)
+                        verifier = self._build_verifier(spec, gen, matter.name)
                     except Exception:
                         # el contraste es un extra: si el 2º modelo no carga
                         # (sin red, sin disco), el lote sigue con el motor
@@ -446,6 +544,8 @@ class KamiruApp:
                         self._queue.put(("status", gen,
                                          "⚠ Sin modelo de contraste (no se pudo "
                                          "cargar); sigo con el control básico."))
+                        notes.append("no se pudo cargar el 2º modelo: ninguna "
+                                     "foto tuvo contraste, solo el control básico.")
                 if self._is_stale(gen):
                     return  # cancelado durante la carga: el modelo queda cacheado
                 summary = run_batch(
@@ -455,12 +555,20 @@ class KamiruApp:
                     cancel=lambda: self._is_stale(gen),
                     verifier=verifier,
                 )
-                self._queue.put(("done", gen, summary))
+                summary.notes.extend(notes)
+                fell_back = self._drop_cpu_fallbacks()
+                if fell_back:
+                    from ..core.matting import CPU_FALLBACK_NOTE
+
+                    summary.notes.append(CPU_FALLBACK_NOTE + " El próximo Procesar "
+                                         "vuelve a probar la GPU.")
+                self._queue.put(("done", gen, summary, fell_back))
             except Exception as exc:
                 log.exception("Fallo del lote")
                 self._queue.put(("fatal", gen, str(exc)))
 
-        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker = threading.Thread(target=self._exclusive, args=(gen, work),
+                                        daemon=True)
         self._worker.start()
 
     def _preview(self) -> None:
@@ -487,6 +595,7 @@ class KamiruApp:
                     return
                 loaded = load_image(first)
                 result = matter.cutout(loaded.rgb)
+                self._drop_cpu_fallbacks()
                 from ..core.quality import assess_cutout
 
                 reasons = [f.message for f in assess_cutout(loaded.rgb, result.alpha).flags]
@@ -495,7 +604,7 @@ class KamiruApp:
                 log.exception("Fallo de la vista previa")
                 self._queue.put(("fatal", gen, str(exc)))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=self._exclusive, args=(gen, work), daemon=True).start()
 
     def _show_preview(self, name: str, rgba, reasons: list[str]) -> None:
         from PIL import Image, ImageTk
@@ -544,13 +653,19 @@ class KamiruApp:
                 kind = msg[0]
                 if kind == "device":
                     info = msg[1]
+                    self._device_name = info.name
                     self.device_lbl.configure(text=info.name)
-                    if info.warning:
+                    # con un trabajo en curso, el aviso no tapa su estado
+                    if info.warning and self._busy_since is None:
                         self._set_status(f"⚠ {info.warning}")
                         self._set_summary(f"⚠ {info.warning}")
                     continue
                 if kind == "device_error":
                     self.device_lbl.configure(text="PyTorch no disponible")
+                    continue
+                if kind == "model":
+                    # caída a BiRefNet sin token: vale aunque se haya cancelado
+                    self.model.set(msg[1])
                     continue
 
                 # el resto de los mensajes vienen etiquetados con la
@@ -570,8 +685,10 @@ class KamiruApp:
                     self._set_status("Vista previa lista.")
                     self._show_preview(msg[2], msg[3], msg[4])
                 elif kind == "done":
-                    summary = msg[2]
+                    summary, fell_back = msg[2], msg[3]
                     self._end_job()
+                    if fell_back:
+                        self.device_lbl.configure(text="CPU (la GPU falló en este lote)")
                     self.open_out_btn.configure(state="normal")
                     self.progress.configure(value=self.progress["maximum"])
                     self._set_status("Terminado.")

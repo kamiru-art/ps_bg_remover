@@ -5,12 +5,18 @@ Reglas de nomenclatura del spec:
 - Individual: ``<nombre_origen>_01.<ext>``, ``_02``, ... con relleno de ceros.
 - Sin sobrescritura: si el destino existe se agrega ``-1``, ``-2``, ...
 
+Cada archivo se escribe primero a un temporal oculto junto al destino
+(``.foto.png.part``) y se renombra al terminar: un corte a mitad (disco
+lleno, ventana cerrada) no deja un archivo truncado con nombre válido.
+
 El perfil ICC de la imagen origen se re-embebe en PNG y TIFF para mantener
 color consistente.
 """
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +43,18 @@ def unique_path(folder: Path, stem: str, ext: str) -> Path:
     return candidate
 
 
+@contextmanager
+def _atomic_write(path: Path):
+    """Da una ruta temporal; al salir sin error la renombra a ``path``."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.part")
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)  # solo queda si hubo un error
+
+
 def numbered_stem(stem: str, index: int, total: int) -> str:
     width = max(2, len(str(total)))
     return f"{stem}_{index:0{width}d}"
@@ -45,7 +63,8 @@ def numbered_stem(stem: str, index: int, total: int) -> str:
 def save_png(rgba: np.ndarray, path: Path, icc_profile: bytes | None = None) -> None:
     im = Image.fromarray(rgba, mode="RGBA")
     kwargs = {"icc_profile": icc_profile} if icc_profile else {}
-    im.save(path, format="PNG", **kwargs)
+    with _atomic_write(path) as tmp:
+        im.save(tmp, format="PNG", **kwargs)
 
 
 def save_tiff(
@@ -63,14 +82,15 @@ def save_tiff(
     extratags = []
     if icc_profile:
         extratags.append((34675, "B", len(icc_profile), icc_profile, True))
-    tifffile.imwrite(
-        path,
-        data,
-        photometric="rgb",
-        extrasamples=["unassalpha"],
-        compression="adobe_deflate",
-        extratags=extratags,
-    )
+    with _atomic_write(path) as tmp:
+        tifffile.imwrite(
+            tmp,
+            data,
+            photometric="rgb",
+            extrasamples=["unassalpha"],
+            compression="adobe_deflate",
+            extratags=extratags,
+        )
 
 
 def save_psd_layers(
@@ -81,7 +101,8 @@ def save_psd_layers(
 ) -> None:
     """PSD por capas. ``layers``: lista de (nombre, rgba uint8, left, top)."""
     psd_layers = [PsdLayer(name=n, rgba=a, left=x, top=y) for n, a, x, y in layers]
-    write_psd(path, psd_layers, width=width, height=height)
+    with _atomic_write(path) as tmp:
+        write_psd(tmp, psd_layers, width=width, height=height)
 
 
 def export_single(
