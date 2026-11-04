@@ -84,6 +84,9 @@ class KamiruApp:
         # queda "huérfano" — la UI se libera al instante sin esperar al hilo
         self._job_gen = 0
         self._busy_since: float | None = None
+        # un solo hilo usa los motores (y escribe en la salida) a la vez: el
+        # trabajo nuevo espera a que el huérfano termine su carga o su foto
+        self._engine_lock = threading.Lock()
 
         self._build_ui()
         self._logfile = setup_batch_logging(logs_dir())
@@ -289,6 +292,10 @@ class KamiruApp:
             subprocess.Popen(["xdg-open", out])
 
     def _on_close(self) -> None:
+        if self._busy_since is not None and not messagebox.askyesno(
+                APP_NAME, "Hay un trabajo en curso. Si cierras ahora, se corta "
+                          "y la foto en curso no se guarda.\n\n¿Cerrar igual?"):
+            return
         self._save_settings()
         self.root.destroy()
 
@@ -413,6 +420,23 @@ class KamiruApp:
     def _is_stale(self, gen: int) -> bool:
         return gen != self._job_gen or self._cancel.is_set()
 
+    def _exclusive(self, gen: int, job) -> None:
+        """Corre ``job`` en el worker con los motores para él solo.
+
+        Tras Cancelar, el hilo viejo puede seguir cargando el modelo o
+        recortando la foto en curso. El trabajo nuevo espera a que termine:
+        así no se carga el modelo dos veces ni corren dos recortes a la vez.
+        """
+        if not self._engine_lock.acquire(blocking=False):
+            self._queue.put(("status", gen, "Esperando a que termine el trabajo "
+                                            "cancelado..."))
+            self._engine_lock.acquire()
+        try:
+            if not self._is_stale(gen):
+                job()
+        finally:
+            self._engine_lock.release()
+
     def _start(self) -> None:
         inputs = self._collect_inputs()
         if inputs is None:
@@ -433,6 +457,7 @@ class KamiruApp:
 
         def work():
             try:
+                notes: list[str] = []
                 matter = self._build_matter(spec, gen)
                 verifier = None
                 if spec["verify"]:
@@ -446,6 +471,8 @@ class KamiruApp:
                         self._queue.put(("status", gen,
                                          "⚠ Sin modelo de contraste (no se pudo "
                                          "cargar); sigo con el control básico."))
+                        notes.append("no se pudo cargar el 2º modelo: ninguna "
+                                     "foto tuvo contraste, solo el control básico.")
                 if self._is_stale(gen):
                     return  # cancelado durante la carga: el modelo queda cacheado
                 summary = run_batch(
@@ -455,12 +482,14 @@ class KamiruApp:
                     cancel=lambda: self._is_stale(gen),
                     verifier=verifier,
                 )
+                summary.notes.extend(notes)
                 self._queue.put(("done", gen, summary))
             except Exception as exc:
                 log.exception("Fallo del lote")
                 self._queue.put(("fatal", gen, str(exc)))
 
-        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker = threading.Thread(target=self._exclusive, args=(gen, work),
+                                        daemon=True)
         self._worker.start()
 
     def _preview(self) -> None:
@@ -495,7 +524,7 @@ class KamiruApp:
                 log.exception("Fallo de la vista previa")
                 self._queue.put(("fatal", gen, str(exc)))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=self._exclusive, args=(gen, work), daemon=True).start()
 
     def _show_preview(self, name: str, rgba, reasons: list[str]) -> None:
         from PIL import Image, ImageTk
@@ -545,7 +574,8 @@ class KamiruApp:
                 if kind == "device":
                     info = msg[1]
                     self.device_lbl.configure(text=info.name)
-                    if info.warning:
+                    # con un trabajo en curso, el aviso no tapa su estado
+                    if info.warning and self._busy_since is None:
                         self._set_status(f"⚠ {info.warning}")
                         self._set_summary(f"⚠ {info.warning}")
                     continue
