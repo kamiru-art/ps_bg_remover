@@ -26,7 +26,8 @@ en la barra de estado) y no vuelve a bajarlo. Sin token de HuggingFace
 - **Para generarlo:** `packaging/build_release.bat` (Windows — detecta la
   GPU y empaqueta PyTorch CUDA 12.8) o `packaging/build_release.command`
   (macOS — PyTorch con MPS). Produce `dist/Kamiru` y el zip
-  `Kamiru-win64.zip` / `Kamiru-macos.zip`. Usa **uv**, así que el build
+  `Kamiru-win64-cuda.zip` o `Kamiru-win64-cpu.zip` (según la GPU de la
+  máquina de build) / `Kamiru-macos.zip`. Usa **uv**, así que el build
   tarda pocos minutos.
 - **Releases automáticos:** al pushear un tag `v*`, GitHub Actions
   (`.github/workflows/release.yml`) construye y publica
