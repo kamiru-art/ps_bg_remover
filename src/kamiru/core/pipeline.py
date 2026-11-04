@@ -321,12 +321,25 @@ def run_batch(
 
 
 def setup_batch_logging(logs_dir: Path) -> Path:
-    """Log a archivo por corrida, para diagnosticar sin terminal."""
+    """Log a archivo por corrida, para diagnosticar sin terminal.
+
+    Cierra el log de la corrida anterior del mismo proceso: cada corrida
+    escribe solo en su archivo.
+    """
     logs_dir.mkdir(parents=True, exist_ok=True)
-    logfile = logs_dir / f"kamiru_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    handler = logging.FileHandler(logfile, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    logfile = logs_dir / f"kamiru_{stamp}.log"
+    n = 1
+    while logfile.exists():  # dos corridas en el mismo segundo
+        logfile = logs_dir / f"kamiru_{stamp}-{n}.log"
+        n += 1
     root = logging.getLogger("kamiru")
+    for old in [h for h in root.handlers if getattr(h, "_kamiru_batch_log", False)]:
+        root.removeHandler(old)
+        old.close()
+    handler = logging.FileHandler(logfile, encoding="utf-8")
+    handler._kamiru_batch_log = True
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     return logfile
