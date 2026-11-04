@@ -138,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = run_batch(inputs, args.salida, matter, opts, progress=progress,
                         verifier=verifier)
+    if matter.fell_back_to_cpu or (verifier is not None and verifier.fell_back_to_cpu):
+        from .core.matting import CPU_FALLBACK_NOTE
+
+        summary.notes.append(CPU_FALLBACK_NOTE)
     print("\n===== Resumen =====")
     print(summary.text())
     print(f"Log: {logfile}")

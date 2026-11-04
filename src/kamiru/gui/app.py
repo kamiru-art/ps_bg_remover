@@ -87,6 +87,7 @@ class KamiruApp:
         # un solo hilo usa los motores (y escribe en la salida) a la vez: el
         # trabajo nuevo espera a que el huérfano termine su carga o su foto
         self._engine_lock = threading.Lock()
+        self._device_name = ""  # dispositivo detectado al abrir la app
 
         self._build_ui()
         self._logfile = setup_batch_logging(logs_dir())
@@ -382,6 +383,21 @@ class KamiruApp:
         self._verifier, self._verifier_key = verifier, key
         return verifier
 
+    def _drop_cpu_fallbacks(self) -> bool:
+        """Saca de la caché los motores que cayeron a CPU (corre en el worker).
+
+        El próximo trabajo los vuelve a cargar en la GPU. Devuelve True si
+        alguno había caído.
+        """
+        fell = False
+        if self._matter is not None and self._matter.fell_back_to_cpu:
+            self._matter, self._matter_key = None, None
+            fell = True
+        if self._verifier is not None and self._verifier.fell_back_to_cpu:
+            self._verifier, self._verifier_key = None, None
+            fell = True
+        return fell
+
     def _validated_options(self) -> BatchOptions | None:
         try:
             min_area = int(self.min_area.get())
@@ -408,6 +424,8 @@ class KamiruApp:
         self.run_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        if self._device_name:  # tras una caída a CPU el motor se recarga en GPU
+            self.device_lbl.configure(text=self._device_name)
         return gen
 
     def _end_job(self) -> None:
@@ -483,7 +501,13 @@ class KamiruApp:
                     verifier=verifier,
                 )
                 summary.notes.extend(notes)
-                self._queue.put(("done", gen, summary))
+                fell_back = self._drop_cpu_fallbacks()
+                if fell_back:
+                    from ..core.matting import CPU_FALLBACK_NOTE
+
+                    summary.notes.append(CPU_FALLBACK_NOTE + " El próximo Procesar "
+                                         "vuelve a probar la GPU.")
+                self._queue.put(("done", gen, summary, fell_back))
             except Exception as exc:
                 log.exception("Fallo del lote")
                 self._queue.put(("fatal", gen, str(exc)))
@@ -516,6 +540,7 @@ class KamiruApp:
                     return
                 loaded = load_image(first)
                 result = matter.cutout(loaded.rgb)
+                self._drop_cpu_fallbacks()
                 from ..core.quality import assess_cutout
 
                 reasons = [f.message for f in assess_cutout(loaded.rgb, result.alpha).flags]
@@ -573,6 +598,7 @@ class KamiruApp:
                 kind = msg[0]
                 if kind == "device":
                     info = msg[1]
+                    self._device_name = info.name
                     self.device_lbl.configure(text=info.name)
                     # con un trabajo en curso, el aviso no tapa su estado
                     if info.warning and self._busy_since is None:
@@ -600,8 +626,10 @@ class KamiruApp:
                     self._set_status("Vista previa lista.")
                     self._show_preview(msg[2], msg[3], msg[4])
                 elif kind == "done":
-                    summary = msg[2]
+                    summary, fell_back = msg[2], msg[3]
                     self._end_job()
+                    if fell_back:
+                        self.device_lbl.configure(text="CPU (la GPU falló en este lote)")
                     self.open_out_btn.configure(state="normal")
                     self.progress.configure(value=self.progress["maximum"])
                     self._set_status("Terminado.")

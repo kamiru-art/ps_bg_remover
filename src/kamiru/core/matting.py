@@ -83,10 +83,16 @@ class MatteResult:
     rgba: Image.Image        # RGBA a resolución completa
 
 
+# Aviso para el resumen cuando un motor cayó de la GPU a la CPU.
+CPU_FALLBACK_NOTE = "la GPU falló y el resto del lote siguió en la CPU (más lento)."
+
+
 class BaseMatter:
     """Interfaz común de los motores de recorte."""
 
     name = "base"
+    # True cuando una inferencia falló en la GPU y el motor pasó a la CPU
+    fell_back_to_cpu = False
 
     def alpha(self, rgb: Image.Image) -> np.ndarray:
         raise NotImplementedError
@@ -198,12 +204,16 @@ class NeuralMatter(BaseMatter):
             try:
                 preds = self._forward(tensor)
             except RuntimeError:
-                if self.device_info.kind != "cpu":
-                    # Fallback: algunas ops pueden no estar soportadas en MPS
-                    log.warning("Fallo en %s; reintentando en CPU", self.device_info.kind)
+                if self._device.type != "cpu":
+                    # Fallback: cualquier RuntimeError en GPU (op no soportada
+                    # en MPS, memoria agotada en CUDA...) repite la foto en
+                    # CPU. El motor queda en CPU; fell_back_to_cpu lo avisa.
+                    log.warning("Fallo en %s; reintentando en CPU", self._device.type,
+                                exc_info=True)
                     self.model.float().to("cpu")
                     self._device = torch.device("cpu")
                     self._half = False
+                    self.fell_back_to_cpu = True
                     preds = self._forward(self._preprocess(rgb))
                 else:
                     raise
