@@ -1,9 +1,10 @@
 @echo off
 REM Kamiru - lanzador de doble clic (Windows)
 cd /d "%~dp0"
-if not exist venv\Scripts\pythonw.exe (
-    echo Primera vez: falta instalar. Corriendo setup_windows.bat...
+REM setup_windows.bat crea el marcador solo cuando la app ya puede abrir
+if not exist venv\kamiru_instalado.txt (
+    echo Falta terminar la instalacion. Corriendo setup_windows.bat...
     call setup_windows.bat
-    if not exist venv\Scripts\pythonw.exe exit /b 1
+    if not exist venv\kamiru_instalado.txt exit /b 1
 )
 start "" venv\Scripts\pythonw.exe -m kamiru.gui.app

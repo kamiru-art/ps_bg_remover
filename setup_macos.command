@@ -7,6 +7,11 @@
 set -e
 cd "$(dirname "$0")"
 
+# Kamiru.command abre la app solo si existe este marcador. Se borra al
+# empezar y se crea en el paso 6, cuando la app ya puede abrir.
+MARCA=venv/kamiru_instalado.txt
+rm -f "$MARCA"
+
 echo
 echo "=== Kamiru: instalación ==="
 echo
@@ -47,8 +52,13 @@ $UV pip install --python "$VPY" torch torchvision
 # --- 5. La app y sus dependencias
 $UV pip install --python "$VPY" -e .
 
-# --- 6. Verificar GPU Apple
+# --- 6. Verificar la GPU Apple y que la app pueda abrir
 "$VPY" -c "import torch; ok=torch.backends.mps.is_available(); print('GPU Apple (MPS):', 'disponible' if ok else 'no disponible (se usará CPU, más lento)')"
+if ! "$VPY" -c "import torch, kamiru.gui.app"; then
+    echo "ERROR: la app no quedó instalada. Revisa los mensajes de arriba."
+    read -r -p "Enter para cerrar..."; exit 1
+fi
+echo ok > "$MARCA"
 
 # --- 7. Token de HuggingFace (RMBG-2.0 es un repo con registro)
 mkdir -p models
